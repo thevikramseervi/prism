@@ -1,0 +1,568 @@
+// Attend Ease - Database Schema
+// This schema enforces correctness, auditability, and data integrity
+// for the Samsung SEED Lab attendance and salary management system.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// USER MANAGEMENT & AUTHENTICATION
+// ============================================================================
+
+model User {
+  id                    String         @id @default(uuid())
+  email                 String         @unique
+  password_hash         String
+  full_name             String
+  is_active             Boolean        @default(true)
+  
+  // Timestamps
+  created_at            DateTime       @default(now())
+  updated_at            DateTime       @updatedAt
+  deleted_at            DateTime?
+  
+  // Refresh token for JWT authentication
+  refresh_token         String?
+  refresh_token_expires DateTime?
+  
+  // Relationships
+  user_roles            UserRole[]
+  lab_member            LabMember?
+  
+  // Audit trail
+  created_attendance_exceptions AttendanceException[] @relation("ExceptionCreator")
+  resolved_attendance_exceptions AttendanceException[] @relation("ExceptionResolver")
+  frozen_attendance     AttendanceFreeze[]
+  calculated_salaries   MonthlySalaryCalculation[]
+  created_adjustments   SalaryAdjustment[]
+  audit_logs            AuditLog[]
+  
+  @@index([email])
+  @@map("users")
+}
+
+model Role {
+  id          String       @id @default(uuid())
+  name        String       @unique // SUPER_ADMIN, LAB_ADMIN, LAB_MEMBER
+  description String?
+  
+  created_at  DateTime     @default(now())
+  updated_at  DateTime     @updatedAt
+  
+  user_roles  UserRole[]
+  
+  @@map("roles")
+}
+
+model UserRole {
+  id         String   @id @default(uuid())
+  user_id    String
+  role_id    String
+  
+  created_at DateTime @default(now())
+  
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  role       Role     @relation(fields: [role_id], references: [id], onDelete: Cascade)
+  
+  @@unique([user_id, role_id])
+  @@index([user_id])
+  @@index([role_id])
+  @@map("user_roles")
+}
+
+// ============================================================================
+// LAB MEMBER & PAYMENT MANAGEMENT
+// ============================================================================
+
+model LabMember {
+  id                    String    @id @default(uuid())
+  user_id               String    @unique
+  
+  // Biometric device identifier mapping
+  biometric_user_id     String    @unique
+  
+  // Lab member details
+  enrollment_number     String    @unique
+  department            String
+  year_of_study         Int
+  joining_date          DateTime
+  exit_date             DateTime?
+  is_active             Boolean   @default(true)
+  
+  // Leave balance (reset yearly)
+  casual_leave_balance  Float     @default(12.0) // 12 units per year
+  leave_balance_year    Int       // Year for which this balance is valid
+  
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+  
+  // Relationships
+  user                  User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  payment_bands         LabMemberPaymentBand[]
+  attendance_records    AttendanceRecord[]
+  attendance_exceptions AttendanceException[]
+  leave_requests        LeaveRequest[]
+  attendance_freezes    AttendanceFreeze[]
+  salary_calculations   MonthlySalaryCalculation[]
+  salary_adjustments    SalaryAdjustment[]
+  salary_slips          SalarySlip[]
+  
+  @@index([biometric_user_id])
+  @@index([enrollment_number])
+  @@index([is_active])
+  @@map("lab_members")
+}
+
+model PaymentBand {
+  id          String   @id @default(uuid())
+  name        String   @unique // e.g., "Intern Level 1", "Intern Level 2"
+  description String?
+  
+  // Salary structure
+  hourly_rate         Float? // If hourly
+  monthly_base_salary Float? // If monthly
+  
+  // Versioning
+  effective_from DateTime
+  effective_to   DateTime?
+  
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+  
+  // Relationships
+  lab_member_assignments LabMemberPaymentBand[]
+  
+  @@index([effective_from, effective_to])
+  @@map("payment_bands")
+}
+
+model LabMemberPaymentBand {
+  id             String      @id @default(uuid())
+  lab_member_id  String
+  payment_band_id String
+  
+  // Assignment period
+  assigned_from  DateTime
+  assigned_to    DateTime?
+  
+  created_at     DateTime    @default(now())
+  
+  lab_member     LabMember   @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  payment_band   PaymentBand @relation(fields: [payment_band_id], references: [id], onDelete: Cascade)
+  
+  @@index([lab_member_id, assigned_from])
+  @@map("lab_member_payment_bands")
+}
+
+// ============================================================================
+// BIOMETRIC ATTENDANCE DATA (APPEND-ONLY)
+// ============================================================================
+
+model BiometricLog {
+  id                  String   @id @default(uuid())
+  
+  // Device information
+  device_id           String
+  biometric_user_id   String   // Device-specific user ID (maps to lab_members.biometric_user_id)
+  
+  // Event data
+  timestamp           DateTime // Device time (NOT trusted for salary logic)
+  event_type          String   // IN, OUT, UNKNOWN
+  
+  // Metadata
+  raw_data            Json?    // Store full device payload for debugging
+  
+  // Server-side timestamp (authoritative)
+  server_received_at  DateTime @default(now())
+  
+  // IMPORTANT: This table is APPEND-ONLY
+  // No updates or deletes allowed
+  created_at          DateTime @default(now())
+  
+  @@index([biometric_user_id, timestamp])
+  @@index([server_received_at])
+  @@map("biometric_logs")
+}
+
+// ============================================================================
+// ATTENDANCE RECORDS (DERIVED FROM BIOMETRIC OR MANUAL)
+// ============================================================================
+
+model AttendanceRecord {
+  id             String   @id @default(uuid())
+  lab_member_id  String
+  date           DateTime @db.Date
+  
+  // Attendance status
+  status         AttendanceStatus // FULL_DAY, HALF_DAY, LOP, CASUAL_LEAVE_FULL, etc.
+  
+  // Source tracking (CRITICAL for auditability)
+  source         AttendanceSource // BIOMETRIC, MANUAL, LEAVE_OVERRIDE, HOLIDAY
+  
+  // Biometric-derived data
+  hours_worked   Float?   // Calculated from biometric logs
+  first_in       DateTime?
+  last_out       DateTime?
+  
+  // Manual override
+  manual_reason  String?  // Mandatory if source is MANUAL
+  
+  // Freeze status
+  is_frozen      Boolean  @default(false)
+  frozen_at      DateTime?
+  
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+  
+  // Relationships
+  lab_member     LabMember @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  
+  // One attendance record per lab member per day
+  @@unique([lab_member_id, date])
+  @@index([lab_member_id, date])
+  @@index([is_frozen])
+  @@index([status])
+  @@map("attendance_records")
+}
+
+enum AttendanceStatus {
+  FULL_DAY              // Worked ≥8 hours, paid 1.0
+  HALF_DAY              // Worked ≥4 hours, paid 0.5
+  LOP                   // Loss of Pay, worked <4 hours, paid 0.0
+  CASUAL_LEAVE_FULL     // Approved full-day CL, paid 1.0
+  CASUAL_LEAVE_HALF     // Approved half-day CL, paid 0.5
+  HOLIDAY               // Non-working day, paid 1.0
+  PENDING_EXCEPTION     // Inconsistent data, blocks freeze
+}
+
+enum AttendanceSource {
+  BIOMETRIC       // Derived from biometric logs
+  MANUAL          // Admin override
+  LEAVE_OVERRIDE  // Approved leave application
+  HOLIDAY         // System-generated for holidays
+}
+
+// ============================================================================
+// ATTENDANCE EXCEPTIONS (MANUAL RESOLUTION REQUIRED)
+// ============================================================================
+
+model AttendanceException {
+  id                String            @id @default(uuid())
+  attendance_record_id String         @unique
+  lab_member_id     String
+  date              DateTime          @db.Date
+  
+  // Exception details
+  exception_type    ExceptionType     // MISSING_DATA, INCONSISTENT_LOGS, etc.
+  description       String            // Auto-generated or admin-provided
+  
+  // Resolution tracking
+  status            ExceptionStatus   @default(PENDING)
+  resolution_note   String?
+  resolved_at       DateTime?
+  resolved_by_id    String?
+  
+  created_at        DateTime          @default(now())
+  created_by_id     String?
+  
+  // Relationships
+  lab_member        LabMember         @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  created_by        User?             @relation("ExceptionCreator", fields: [created_by_id], references: [id], onDelete: SetNull)
+  resolved_by       User?             @relation("ExceptionResolver", fields: [resolved_by_id], references: [id], onDelete: SetNull)
+  
+  @@index([lab_member_id, date])
+  @@index([status])
+  @@map("attendance_exceptions")
+}
+
+enum ExceptionType {
+  MISSING_DATA        // No biometric logs found
+  INCONSISTENT_LOGS   // Logs don't make sense (e.g., OUT before IN)
+  DUPLICATE_LOGS      // Multiple conflicting entries
+  DEVICE_MALFUNCTION  // Known device issue
+  OTHER               // Admin discretion
+}
+
+enum ExceptionStatus {
+  PENDING
+  RESOLVED
+}
+
+// ============================================================================
+// LEAVE MANAGEMENT
+// ============================================================================
+
+model LeaveRequest {
+  id            String         @id @default(uuid())
+  lab_member_id String
+  
+  // Leave details
+  leave_type    LeaveType      @default(CASUAL_LEAVE)
+  start_date    DateTime       @db.Date
+  end_date      DateTime       @db.Date
+  duration      LeaveDuration  // FULL_DAY, HALF_DAY
+  
+  // If half-day, specify which half
+  half_day_period HalfDayPeriod?
+  
+  reason        String
+  
+  // Approval workflow
+  status        LeaveStatus    @default(PENDING)
+  approved_by_id String?
+  approved_at   DateTime?
+  rejection_reason String?
+  
+  // Leave units consumed (calculated)
+  units_consumed Float?        // 1.0 for full day, 0.5 for half day
+  
+  created_at    DateTime       @default(now())
+  updated_at    DateTime       @updatedAt
+  
+  // Relationships
+  lab_member    LabMember      @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  
+  @@index([lab_member_id, start_date])
+  @@index([status])
+  @@map("leave_requests")
+}
+
+enum LeaveType {
+  CASUAL_LEAVE
+  // Future: SICK_LEAVE, COMPENSATORY_OFF, etc.
+}
+
+enum LeaveDuration {
+  FULL_DAY
+  HALF_DAY
+}
+
+enum HalfDayPeriod {
+  FIRST_HALF  // Morning
+  SECOND_HALF // Afternoon
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ============================================================================
+// HOLIDAY CALENDAR
+// ============================================================================
+
+model Holiday {
+  id           String       @id @default(uuid())
+  name         String
+  date         DateTime     @db.Date
+  holiday_type HolidayType  // INSTITUTE, LAB
+  description  String?
+  
+  created_at   DateTime     @default(now())
+  updated_at   DateTime     @updatedAt
+  
+  @@unique([date, holiday_type])
+  @@index([date])
+  @@map("holidays")
+}
+
+enum HolidayType {
+  INSTITUTE // College/Program-level holiday
+  LAB       // Samsung SEED Lab-specific holiday
+}
+
+// ============================================================================
+// ATTENDANCE FREEZE
+// ============================================================================
+
+model AttendanceFreeze {
+  id            String   @id @default(uuid())
+  lab_member_id String
+  
+  // Freeze period
+  year          Int
+  month         Int      // 1-12
+  
+  // Freeze metadata
+  freeze_date   DateTime @default(now())
+  frozen_by_id  String
+  
+  // Immutable after creation
+  created_at    DateTime @default(now())
+  
+  // Relationships
+  lab_member    LabMember @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  frozen_by     User      @relation(fields: [frozen_by_id], references: [id], onDelete: Cascade)
+  
+  // One freeze per lab member per month
+  @@unique([lab_member_id, year, month])
+  @@index([year, month])
+  @@map("attendance_freezes")
+}
+
+// ============================================================================
+// SALARY CALCULATION
+// ============================================================================
+
+model MonthlySalaryCalculation {
+  id                  String   @id @default(uuid())
+  lab_member_id       String
+  
+  // Calculation period
+  year                Int
+  month               Int
+  
+  // Attendance summary
+  total_days_worked   Float    // Sum of paid days (FULL_DAY=1.0, HALF_DAY=0.5, etc.)
+  total_hours_worked  Float?   // If hourly rate is used
+  
+  // Salary breakdown
+  gross_salary        Float
+  breakdown           Json     // Transparent calculation details (JSONB)
+  
+  // Metadata
+  calculated_at       DateTime @default(now())
+  calculated_by_id    String
+  
+  // Immutable after creation
+  created_at          DateTime @default(now())
+  
+  // Relationships
+  lab_member          LabMember @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  calculated_by       User      @relation(fields: [calculated_by_id], references: [id], onDelete: Cascade)
+  salary_adjustments  SalaryAdjustment[]
+  salary_slips        SalarySlip[]
+  
+  // One calculation per lab member per month
+  @@unique([lab_member_id, year, month])
+  @@index([year, month])
+  @@map("monthly_salary_calculations")
+}
+
+model SalaryAdjustment {
+  id                    String                  @id @default(uuid())
+  salary_calculation_id String
+  lab_member_id         String
+  
+  // Adjustment details
+  adjustment_type       AdjustmentType
+  amount                Float                   // Positive for bonus, negative for deduction
+  reason                String
+  
+  // Metadata
+  created_at            DateTime                @default(now())
+  created_by_id         String
+  
+  // Relationships
+  salary_calculation    MonthlySalaryCalculation @relation(fields: [salary_calculation_id], references: [id], onDelete: Cascade)
+  lab_member            LabMember                @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  created_by            User                     @relation(fields: [created_by_id], references: [id], onDelete: Cascade)
+  
+  @@index([salary_calculation_id])
+  @@map("salary_adjustments")
+}
+
+enum AdjustmentType {
+  BONUS
+  DEDUCTION
+  CORRECTION
+}
+
+// ============================================================================
+// SALARY SLIPS (PDF/XLSX/CSV)
+// ============================================================================
+
+model SalarySlip {
+  id                    String                  @id @default(uuid())
+  salary_calculation_id String
+  lab_member_id         String
+  
+  // File metadata
+  file_path             String   // Storage location
+  format                SlipFormat
+  file_size_bytes       Int?
+  
+  // Generation metadata
+  generated_at          DateTime @default(now())
+  
+  // Relationships
+  salary_calculation    MonthlySalaryCalculation @relation(fields: [salary_calculation_id], references: [id], onDelete: Cascade)
+  lab_member            LabMember                @relation(fields: [lab_member_id], references: [id], onDelete: Cascade)
+  
+  @@index([salary_calculation_id])
+  @@index([lab_member_id])
+  @@map("salary_slips")
+}
+
+enum SlipFormat {
+  PDF
+  XLSX
+  CSV
+}
+
+// ============================================================================
+// AUDIT LOGGING (APPEND-ONLY)
+// ============================================================================
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  
+  // Actor (null for SYSTEM actions)
+  actor_user_id String?
+  actor_type    String   // USER, SYSTEM
+  
+  // Action details
+  action_type   String   // CREATED, UPDATED, DELETED, APPROVED, REJECTED, FROZEN, CALCULATED, etc.
+  entity_type   String   // Table name
+  entity_id     String   // Record ID
+  
+  // Change tracking
+  before_value  Json?    // State before action
+  after_value   Json?    // State after action
+  
+  // Metadata
+  ip_address    String?
+  user_agent    String?
+  
+  // Timestamp
+  created_at    DateTime @default(now())
+  
+  // Relationships
+  actor_user    User?    @relation(fields: [actor_user_id], references: [id], onDelete: SetNull)
+  
+  @@index([entity_type, entity_id])
+  @@index([action_type])
+  @@index([created_at])
+  @@index([actor_user_id])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+// SYSTEM SETTINGS (CONFIGURABLE BUSINESS RULES)
+// ============================================================================
+
+model SystemSetting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String   // Store as string, parse as needed
+  data_type   String   // INT, FLOAT, BOOLEAN, STRING, JSON
+  description String?
+  
+  // Versioning
+  effective_from DateTime @default(now())
+  effective_to   DateTime?
+  
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+  
+  @@index([key, effective_from])
+  @@map("system_settings")
+}

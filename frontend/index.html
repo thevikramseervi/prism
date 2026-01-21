@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Attend Ease - Samsung SEED Labs Attendance & Billing Portal" />
+    <meta name="theme-color" content="#0066CC" />
+    
+    <!-- Preload fonts for performance -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet" />
+    
+    <title>Attend Ease | Samsung SEED Labs</title>
+    
+    <style>
+      /* Critical CSS for initial load */
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      
+      body {
+        font-family: 'Roboto', 'Noto Sans KR', -apple-system, BlinkMacSystemFont, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        background-color: #F8F9FA;
+      }
+      
+      #root {
+        min-height: 100vh;
+      }
+      
+      /* Loading spinner for initial app load */
+      .initial-loader {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        background: linear-gradient(135deg, #0066CC 0%, #00ADEF 100%);
+      }
+      
+      .initial-loader__spinner {
+        width: 48px;
+        height: 48px;
+        border: 4px solid rgba(255, 255, 255, 0.3);
+        border-top-color: #FFFFFF;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      
+      .initial-loader__text {
+        margin-top: 16px;
+        color: #FFFFFF;
+        font-size: 16px;
+        font-weight: 500;
+        letter-spacing: 0.5px;
+      }
+      
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      
+      /* Print styles */
+      @media print {
+        body {
+          background: white;
+        }
+        .no-print {
+          display: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="initial-loader">
+        <div class="initial-loader__spinner"></div>
+        <p class="initial-loader__text">Loading Attend Ease...</p>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
